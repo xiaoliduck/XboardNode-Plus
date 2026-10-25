@@ -1,6 +1,7 @@
 package xray
 
 import (
+	"context"
 	"sync/atomic"
 	"testing"
 
@@ -30,18 +31,14 @@ func TestLimitDispatcher_DeviceLimitCheck(t *testing.T) {
 
 	emailToUID := make(map[string]int)
 	deviceLimits := make(map[string]int)
-	speedLimits := make(map[string]int)
 	for _, u := range users {
 		email := userEmail(u.ID)
 		emailToUID[email] = u.ID
 		if u.DeviceLimit > 0 {
 			deviceLimits[email] = u.DeviceLimit
 		}
-		if u.SpeedLimit > 0 {
-			speedLimits[email] = u.SpeedLimit
-		}
 	}
-	ld.UpdateLimits(emailToUID, deviceLimits, speedLimits)
+	ld.UpdateLimits(emailToUID, deviceLimits, nil)
 
 	email1 := userEmail(1)
 
@@ -195,13 +192,38 @@ func TestLimitDispatcher_TrackLinkPreservesReader(t *testing.T) {
 	origWriter := &closeTrackingWriter{Writer: buf.Discard, onClose: func() {}}
 	link := &transport.Link{Reader: origReader, Writer: origWriter}
 
-	ld.trackLink(link, email, "1.1.1.1", true, nil)
+	ld.trackLink(context.Background(), link, email, "1.1.1.1", true, nil)
 
 	if link.Reader != origReader {
 		t.Fatal("trackLink must not replace link.Reader")
 	}
 	if link.Writer == origWriter {
 		t.Fatal("trackLink should wrap link.Writer for lifecycle callbacks")
+	}
+}
+
+func TestLimitDispatcher_CloseUserLeavesOtherUsers(t *testing.T) {
+	ld := newTestDispatcher()
+	email1 := userEmail(1)
+	email2 := userEmail(2)
+	a1 := accesslog.NewActivity(accesslog.Event{SessionID: "s1", UserID: 1})
+	a2 := accesslog.NewActivity(accesslog.Event{SessionID: "s2", UserID: 2})
+	link1 := &transport.Link{Reader: nopReader{}, Writer: buf.Discard}
+	link2 := &transport.Link{Reader: nopReader{}, Writer: buf.Discard}
+	ld.trackLink(context.Background(), link1, email1, "1.1.1.1", true, a1)
+	ld.trackLink(context.Background(), link2, email2, "2.2.2.2", true, a2)
+
+	if got := ld.CloseUser(email1); got != 1 {
+		t.Fatalf("CloseUser() = %d, want 1", got)
+	}
+	if got := ld.connCount.Load(); got != 1 {
+		t.Fatalf("connCount = %d, want 1 (the other user stays)", got)
+	}
+	if got := ld.CloseUser(email1); got != 0 {
+		t.Fatalf("second CloseUser() = %d, want 0", got)
+	}
+	if _, ok := link2.Writer.(*closeTrackingWriter); !ok {
+		t.Fatal("other user's writer should still be tracked")
 	}
 }
 
@@ -215,7 +237,7 @@ func TestLimitDispatcher_CloseTrackingWriterReleasesConn(t *testing.T) {
 
 	activity := accesslog.NewActivity(accesslog.Event{SessionID: "test-session", UserID: 1})
 	link := &transport.Link{Reader: nopReader{}, Writer: buf.Discard}
-	ld.trackLink(link, email, "1.1.1.1", true, activity)
+	ld.trackLink(context.Background(), link, email, "1.1.1.1", true, activity)
 
 	if got := ld.connCount.Load(); got != 1 {
 		t.Fatalf("expected connCount=1 after tracking, got %d", got)

@@ -10,7 +10,6 @@ import (
 	"github.com/cedar2025/xboard-node/internal/model"
 	appstats "github.com/xtls/xray-core/app/stats"
 	xrayCore "github.com/xtls/xray-core/core"
-	featurebandwidth "github.com/xtls/xray-core/features/bandwidth"
 	xraystats "github.com/xtls/xray-core/features/stats"
 	"golang.org/x/time/rate"
 )
@@ -140,7 +139,7 @@ func TestXrayUpdateDispatcherLimitsPropagatesDeviceMetadata(t *testing.T) {
 	}
 }
 
-func TestXraySetSpeedLimitFuncUsesPatchedCorePath(t *testing.T) {
+func TestXraySetSpeedLimitFuncSkipsCallbackWithoutUsers(t *testing.T) {
 	x := New(config.KernelConfig{Type: "xray"})
 	called := false
 
@@ -150,7 +149,7 @@ func TestXraySetSpeedLimitFuncUsesPatchedCorePath(t *testing.T) {
 	})
 
 	if called {
-		t.Fatal("patched xray path should not consult external speed-limit callbacks")
+		t.Fatal("speed-limit callback should not run when no users are loaded")
 	}
 
 	mu, err := toMemoryUser("vless", &model.NodeSpec{Protocol: "vless"}, model.UserSpec{ID: 1, UUID: "11111111-1111-1111-1111-111111111111", SpeedLimit: 8})
@@ -175,30 +174,20 @@ func TestXrayCapabilities(t *testing.T) {
 }
 
 
-func TestXrayUpdateBandwidthLimitsWritesPatchedCoreFeature(t *testing.T) {
-	inst := new(xrayCore.Instance)
-	bm := featurebandwidth.New()
-	if err := inst.AddFeature(bm); err != nil {
-		t.Fatalf("Instance.AddFeature(bandwidth) error = %v", err)
-	}
+func TestXrayUpdateDispatcherLimitsWritesSpeedLimiter(t *testing.T) {
 	x := New(config.KernelConfig{Type: "xray"})
-	x.instance = inst
-	x.updateBandwidthLimits([]model.UserSpec{{ID: 1, UUID: "uuid-1", SpeedLimit: 8}})
-	lim := bm.GetUserLimiter(userEmail(1))
-	if lim == nil {
-		t.Fatal("expected patched bandwidth feature to receive user limiter")
+	ld := newTestDispatcher()
+	x.limitDispatcher = ld
+	x.updateDispatcherLimits([]model.UserSpec{{ID: 1, UUID: "uuid-1", SpeedLimit: 8}})
+	if ld.speedLimiters[userEmail(1)] == nil {
+		t.Fatal("expected dispatcher to receive user speed limiter")
 	}
 }
 
-
-func TestXrayUpdateBandwidthLimitsUsesSpeedLimitFunc(t *testing.T) {
-	inst := new(xrayCore.Instance)
-	bm := featurebandwidth.New()
-	if err := inst.AddFeature(bm); err != nil {
-		t.Fatalf("Instance.AddFeature(bandwidth) error = %v", err)
-	}
+func TestXrayUpdateDispatcherLimitsUsesSpeedLimitFunc(t *testing.T) {
 	x := New(config.KernelConfig{Type: "xray"})
-	x.instance = inst
+	ld := newTestDispatcher()
+	x.limitDispatcher = ld
 	x.users = []model.UserSpec{{ID: 1, UUID: "uuid-1", SpeedLimit: 8}}
 	shared := rate.NewLimiter(7, 7)
 	x.SetSpeedLimitFunc(func(uuid string) *rate.Limiter {
@@ -207,37 +196,25 @@ func TestXrayUpdateBandwidthLimitsUsesSpeedLimitFunc(t *testing.T) {
 		}
 		return shared
 	})
-	lim := bm.GetUserLimiter(userEmail(1))
-	if lim != shared {
-		t.Fatal("expected patched bandwidth feature to consume shared limiter from callback")
+	if ld.speedLimiters[userEmail(1)] != shared {
+		t.Fatal("expected dispatcher to consume shared limiter from callback")
 	}
 }
 
-
-func TestXrayUpdateBandwidthLimitsFallsBackToUserSpeed(t *testing.T) {
-	inst := new(xrayCore.Instance)
-	bm := featurebandwidth.New()
-	if err := inst.AddFeature(bm); err != nil {
-		t.Fatalf("Instance.AddFeature(bandwidth) error = %v", err)
-	}
+func TestXrayUpdateDispatcherLimitsFallsBackToUserSpeed(t *testing.T) {
 	x := New(config.KernelConfig{Type: "xray"})
-	x.instance = inst
-	x.users = []model.UserSpec{{ID: 2, UUID: "uuid-2", SpeedLimit: 16}}
-	x.updateBandwidthLimits(nil)
-	if bm.GetUserLimiter(userEmail(2)) == nil {
+	ld := newTestDispatcher()
+	x.limitDispatcher = ld
+	x.updateDispatcherLimits([]model.UserSpec{{ID: 2, UUID: "uuid-2", SpeedLimit: 16}})
+	if ld.speedLimiters[userEmail(2)] == nil {
 		t.Fatal("expected fallback limiter derived from user speed")
 	}
 }
 
-
-func TestXrayUpdateUsersLimitOnlyRefreshesDispatcherAndBandwidth(t *testing.T) {
+func TestXrayUpdateUsersLimitOnlyRefreshesDispatcher(t *testing.T) {
 	x := New(config.KernelConfig{Type: "xray"})
 	ld := newTestDispatcher()
 	inst := new(xrayCore.Instance)
-	bm := featurebandwidth.New()
-	if err := inst.AddFeature(bm); err != nil {
-		t.Fatalf("Instance.AddFeature(bandwidth) error = %v", err)
-	}
 	x.instance = inst
 	x.limitDispatcher = ld
 	x.users = []model.UserSpec{{ID: 1, UUID: "uuid-1", DeviceLimit: 1, SpeedLimit: 8}}
@@ -252,8 +229,8 @@ func TestXrayUpdateUsersLimitOnlyRefreshesDispatcherAndBandwidth(t *testing.T) {
 	if got := ld.deviceLimits[userEmail(1)]; got != 3 {
 		t.Fatalf("device limit after refresh = %d, want 3", got)
 	}
-	if bm.GetUserLimiter(userEmail(1)) == nil {
-		t.Fatal("expected bandwidth limiter to be refreshed for unchanged user set")
+	if ld.speedLimiters[userEmail(1)] == nil {
+		t.Fatal("expected speed limiter to be refreshed for unchanged user set")
 	}
 }
 

@@ -39,8 +39,11 @@ func TestNodeMailboxFullUsersOverwriteAndDeltaBeforeBaseline(t *testing.T) {
 	})
 	mb.MarkReady()
 	state := mb.DrainIfReady()
-	if !state.NeedsReconcile {
-		t.Fatal("expected reconcile when delta arrives before baseline")
+	if state.NeedsReconcile {
+		t.Fatal("delta before baseline must be queued, not reconciled")
+	}
+	if state.HasUsers {
+		t.Fatal("queued delta has no baseline to publish yet")
 	}
 
 	mb.Apply(Event{Type: EventSyncUsers, Users: []model.UserSpec{{ID: 1, UUID: "u1"}}})
@@ -78,10 +81,10 @@ func TestNodeMailboxReconcileNotifies(t *testing.T) {
 	default:
 	}
 
-	// Delta without baseline should trigger reconcile AND notify
+	// An unknown delta action still asks for a full reconcile.
 	mb.Apply(Event{
 		Type:        EventSyncUserDelta,
-		DeltaAction: "add",
+		DeltaAction: "invalid_action",
 		DeltaUsers:  []model.UserSpec{{ID: 1, UUID: "u1"}},
 	})
 
@@ -130,6 +133,41 @@ func TestNodeMailboxSeedBaselineEnablesDelta(t *testing.T) {
 	}
 	if len(state.Users) != 3 {
 		t.Fatalf("expected 3 users, got %d: %+v", len(state.Users), state.Users)
+	}
+}
+
+func TestNodeMailboxPendingDeltaAppliesOnSeed(t *testing.T) {
+	mb := NewNodeMailbox()
+	mb.Apply(Event{
+		Type:        EventSyncUserDelta,
+		DeltaAction: "remove",
+		DeltaUsers:  []model.UserSpec{{ID: 1, UUID: "u1"}},
+	})
+	mb.SeedBaseline([]model.UserSpec{{ID: 1, UUID: "u1"}, {ID: 2, UUID: "u2"}}, nil)
+	mb.MarkReady()
+
+	state := mb.DrainIfReady()
+	if state.NeedsReconcile {
+		t.Fatal("seeded pending delta must not reconcile")
+	}
+	if !state.HasUsers {
+		t.Fatal("expected users after applying the queued removal")
+	}
+	if len(state.Users) != 1 || state.Users[0].ID != 2 {
+		t.Fatalf("users = %+v, want only user 2", state.Users)
+	}
+
+	mb.Apply(Event{
+		Type:        EventSyncUserDelta,
+		DeltaAction: "remove",
+		DeltaUsers:  []model.UserSpec{{ID: 1, UUID: "u1"}},
+	})
+	state = mb.DrainIfReady()
+	if state.NeedsReconcile {
+		t.Fatal("duplicate removal must not reconcile")
+	}
+	if len(state.Users) != 1 || state.Users[0].ID != 2 {
+		t.Fatalf("users after duplicate = %+v, want only user 2", state.Users)
 	}
 }
 

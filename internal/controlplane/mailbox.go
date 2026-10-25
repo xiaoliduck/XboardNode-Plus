@@ -31,7 +31,16 @@ type NodeMailbox struct {
 	dirtyDevices     bool
 	needsReconcile   bool
 	hasFullUserState bool
-	notifyCh         chan struct{}
+	// pendingDeltas are user add/remove events that arrived before a baseline.
+	// They are applied onto the baseline instead of becoming a REST reconcile,
+	// which the panel can answer with 304 and drop.
+	pendingDeltas []pendingDelta
+	notifyCh      chan struct{}
+}
+
+type pendingDelta struct {
+	action string
+	users  []model.UserSpec
 }
 
 func NewNodeMailbox() *NodeMailbox {
@@ -54,6 +63,7 @@ func (m *NodeMailbox) SeedBaseline(users []model.UserSpec, config *model.NodeSpe
 	if users != nil && !m.hasFullUserState {
 		m.users = cloneUsers(users)
 		m.hasFullUserState = true
+		m.flushPendingLocked()
 	}
 	if config != nil && m.config == nil {
 		m.config = cloneNodeSpec(config)
@@ -76,6 +86,8 @@ func (m *NodeMailbox) Apply(event Event) {
 			m.users = cloneUsers(event.Users)
 			m.dirtyUsers = true
 			m.hasFullUserState = true
+			// A full user list is newer than anything queued before it.
+			m.pendingDeltas = nil
 			changed = true
 		}
 	case EventSyncDevices:
@@ -87,9 +99,19 @@ func (m *NodeMailbox) Apply(event Event) {
 	case EventSyncUserDelta:
 		if len(event.DeltaUsers) > 0 {
 			if !m.hasFullUserState {
-				m.needsReconcile = true
+				if event.DeltaAction != "add" && event.DeltaAction != "remove" {
+					m.needsReconcile = true
+					changed = true
+					break
+				}
+				m.pendingDeltas = append(m.pendingDeltas, pendingDelta{
+					action: event.DeltaAction,
+					users:  cloneUsers(event.DeltaUsers),
+				})
 				changed = true
-			} else if !applyUserDelta(&m.users, event.DeltaAction, event.DeltaUsers) {
+				break
+			}
+			if !applyUserDelta(&m.users, event.DeltaAction, event.DeltaUsers) {
 				m.needsReconcile = true
 				changed = true
 			} else {
@@ -138,6 +160,17 @@ func (m *NodeMailbox) DrainIfReady() MailboxState {
 	}
 	m.needsReconcile = false
 	return state
+}
+
+func (m *NodeMailbox) flushPendingLocked() {
+	if len(m.pendingDeltas) == 0 {
+		return
+	}
+	for _, delta := range m.pendingDeltas {
+		applyUserDelta(&m.users, delta.action, delta.users)
+	}
+	m.pendingDeltas = nil
+	m.dirtyUsers = true
 }
 
 func cloneNodeSpec(spec *model.NodeSpec) *model.NodeSpec {

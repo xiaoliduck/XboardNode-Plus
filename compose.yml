@@ -1,6 +1,6 @@
 services:
   xboardnode-plus:
-    image: ghcr.io/xboardnext999/xboardnode-plus:latest
+    image: jqjbot/botbot:latest
     container_name: xboardnode-plus
     restart: always
     network_mode: host

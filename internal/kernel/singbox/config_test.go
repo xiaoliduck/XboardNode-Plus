@@ -564,6 +564,7 @@ func TestBuildConfig(t *testing.T) {
 		t.Errorf("outbounds: got %d, want 2", len(outbounds))
 	}
 	assertMapValue(t, outbounds[0], "type", "direct")
+	assertMapValue(t, outbounds[0], "domain_strategy", "prefer_ipv4")
 	assertMapValue(t, outbounds[1], "type", "block")
 
 	inbounds := cfg["inbounds"].([]M)

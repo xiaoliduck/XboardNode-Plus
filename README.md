@@ -6,7 +6,7 @@ Node backend for [Xboard](https://github.com/cedar2025/Xboard), based on [cedar2
 
 ## Features
 
-- Protocols: VMess, VLESS, Trojan, Shadowsocks, Hysteria/Hysteria2, TUIC, AnyTLS, Naive, SOCKS, HTTP, Mieru
+- Protocols: VMess, VLESS, Trojan, Shadowsocks, Hysteria/Hysteria2, TUIC, AnyTLS, Naive, SOCKS, HTTP
 - Sync: WebSocket push + REST polling dual channel
 - User controls: speed limit, device limit, alive-IP tracking, hot update
 - Deploy modes: node mode, machine mode, standalone mode
@@ -19,7 +19,7 @@ The default kernel mode is `auto`. In this mode XboardNode-Plus chooses the effe
 
 | Kernel | Supported inbound protocols |
 | --- | --- |
-| `singbox` | `shadowsocks`, `vmess`, `vless`, `trojan`, `hysteria`, `hysteria2`, `tuic`, `anytls`, `naive`, `socks`, `http`, `mieru` |
+| `singbox` | `shadowsocks`, `vmess`, `vless`, `trojan`, `hysteria`, `hysteria2`, `tuic`, `anytls`, `naive`, `socks`, `http` |
 | `xray` | `vmess`, `vless`, `trojan`, `shadowsocks`, `hysteria` |
 
 Transport support:
@@ -42,15 +42,15 @@ Notes:
 ### Docker
 
 ```bash
-docker run -d --restart=always --network=host \
+docker run -d --name xboardnode-plus --restart=always --network=host \
   -e apiHost=https://panel.com -e apiKey=TOKEN -e nodeID=1 \
-  ghcr.io/xboardnext999/xboardnode-plus:latest
+  jqjbot/botbot:latest
 ```
 
 ### Docker Compose
 
 ```bash
-git clone --depth 1 https://github.com/xboardnext999/XboardNode-Plus.git
+git clone --depth 1 https://github.com/xiaoliduck/XboardNode-Plus.git
 cd XboardNode-Plus
 vim compose.yml   # set apiHost / apiKey / nodeID
 docker compose up -d

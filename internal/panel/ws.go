@@ -7,6 +7,7 @@ import (
 	"math/rand"
 	"net/url"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -130,6 +131,9 @@ func NewWSClient(wsURL string, token string, nodeID int, cfg WSClientConfig, onE
 	if cfg.BackoffMax == 0 {
 		cfg.BackoffMax = 60 * time.Second
 	}
+	if normalized, err := normalizeWSURL(wsURL); err == nil {
+		wsURL = normalized
+	}
 	return &WSClient{
 		wsURL:    wsURL,
 		token:    token,
@@ -139,6 +143,32 @@ func NewWSClient(wsURL string, token string, nodeID int, cfg WSClientConfig, onE
 		onStatus: onStatus,
 		onPing:   onPing,
 	}
+}
+
+// normalizeWSURL trims the panel handshake URL and maps http(s) to ws(s).
+// gorilla/websocket only accepts schemes "ws" and "wss".
+func normalizeWSURL(raw string) (string, error) {
+	raw = strings.TrimSpace(raw)
+	raw = strings.NewReplacer("：", ":", "／", "/").Replace(raw)
+	u, err := url.Parse(raw)
+	if err != nil {
+		return "", fmt.Errorf("parse ws url: %w", err)
+	}
+	switch strings.ToLower(u.Scheme) {
+	case "http":
+		u.Scheme = "ws"
+	case "https":
+		u.Scheme = "wss"
+	case "ws", "wss":
+		u.Scheme = strings.ToLower(u.Scheme)
+	default:
+		return "", fmt.Errorf("malformed ws or wss URL %q", raw)
+	}
+	if u.Host == "" {
+		return "", fmt.Errorf("malformed ws or wss URL: missing host in %q", raw)
+	}
+	u.User = nil
+	return u.String(), nil
 }
 
 func (w *WSClient) IsConnected() bool { return w.connected.Load() }
@@ -197,7 +227,11 @@ func (w *WSClient) Run(ctx context.Context) {
 }
 
 func (w *WSClient) connect(ctx context.Context) error {
-	u, err := url.Parse(w.wsURL)
+	normalized, err := normalizeWSURL(w.wsURL)
+	if err != nil {
+		return err
+	}
+	u, err := url.Parse(normalized)
 	if err != nil {
 		return fmt.Errorf("parse ws url: %w", err)
 	}
@@ -210,14 +244,15 @@ func (w *WSClient) connect(ctx context.Context) error {
 	}
 	u.RawQuery = q.Encode()
 
-	nlog.Core().Debug("ws connecting", "url", u.String())
+	safeURL := u.Scheme + "://" + u.Host + u.Path
+	nlog.Core().Debug("ws connecting", "url", safeURL)
 
 	dialer := websocket.Dialer{
 		HandshakeTimeout: w.cfg.HandshakeTimeout,
 	}
 	conn, _, err := dialer.DialContext(ctx, u.String(), nil)
 	if err != nil {
-		return fmt.Errorf("dial: %w", err)
+		return fmt.Errorf("dial %s: %w", safeURL, err)
 	}
 	defer conn.Close()
 
@@ -421,13 +456,13 @@ func (w *WSClient) handleDataEvent(msg wsMessage) {
 
 	case WSEventSyncDevices:
 		nlog.Core().Debug("ws sync devices event received")
-		var p syncDevicesPayload
-		if err := decodeData(msg.Data, &p); err != nil {
+		var raw map[string]interface{}
+		if err := json.Unmarshal(msg.Data, &raw); err != nil {
 			nlog.Core().Warn("ws: cannot decode devices payload", "error", err)
 			return
 		}
-		event.DeviceUsers = p.Users
-		event.NodeID = p.NodeID
+		event.DeviceUsers = parseDeviceUsers(raw["users"])
+		event.NodeID = firstInt(raw["node_id"])
 
 	case WSEventSyncNodes:
 		nlog.Core().Info("ws sync nodes event received (machine node list changed)")

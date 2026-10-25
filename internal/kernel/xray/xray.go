@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -15,7 +16,6 @@ import (
 	"github.com/xtls/xray-core/common/protocol"
 	"github.com/xtls/xray-core/common/uuid"
 	xrayCore "github.com/xtls/xray-core/core"
-	featurebandwidth "github.com/xtls/xray-core/features/bandwidth"
 	"github.com/xtls/xray-core/features/inbound"
 	"github.com/xtls/xray-core/features/stats"
 	"github.com/xtls/xray-core/infra/conf/serial"
@@ -69,6 +69,9 @@ type Xray struct {
 	lastKernelHash  string
 	cumTraffic      map[int][2]int64
 	speedLimitFunc  func(string) *rate.Limiter
+	// removedEmail keeps UUID → email after a user leaves the active table,
+	// so a later close can still find the links that were tracked by email.
+	removedEmail map[string]string
 
 	// running is set after a successful Start and cleared before shutdown.
 	// Atomic so IsRunning / GetConnections never block.
@@ -151,6 +154,7 @@ func (x *Xray) Start(nodeConfig *model.NodeSpec, users []model.UserSpec, tls ker
 	x.instance = inst
 	x.limitDispatcher = ld
 	x.users = users
+	x.removedEmail = nil
 	x.nodeConfig = nodeConfig
 	x.tls = tls
 	x.protocol = nodeConfig.Protocol
@@ -164,7 +168,6 @@ func (x *Xray) Start(nodeConfig *model.NodeSpec, users []model.UserSpec, tls ker
 	closeOld(old, oldLD)
 
 	x.updateDispatcherLimits(users)
-	x.updateBandwidthLimits(users)
 
 	nlog.Core().Info("xray started",
 		"users", len(users),
@@ -179,7 +182,6 @@ func (x *Xray) Start(nodeConfig *model.NodeSpec, users []model.UserSpec, tls ker
 // if any kernel-affecting fields (hash mismatch) have changed.
 func (x *Xray) Reload(nodeConfig *model.NodeSpec, users []model.UserSpec, tls kernel.TLSCert) error {
 	x.updateDispatcherLimits(users)
-	x.updateBandwidthLimits(users)
 
 	newHash := kernel.ComputeHash(nodeConfig, users)
 
@@ -261,19 +263,35 @@ func (x *Xray) CloseConnection(_ context.Context, _ string) error {
 	return nil
 }
 
-func (x *Xray) CloseUserConnections(_ context.Context, _ string) error {
-	// No-op: handled by RemoveUsers at the xray core level.
+func (x *Xray) CloseUserConnections(_ context.Context, uuid string) error {
+	x.mu.Lock()
+	ld := x.limitDispatcher
+	email := ""
+	for _, u := range x.users {
+		if u.UUID == uuid {
+			email = userEmail(u.ID)
+			break
+		}
+	}
+	if email == "" && x.removedEmail != nil {
+		email = x.removedEmail[uuid]
+	}
+	x.mu.Unlock()
+	if ld == nil || email == "" {
+		return nil
+	}
+	ld.CloseUser(email)
 	return nil
 }
 
-// SetSpeedLimitFunc wires xray's patched bandwidth feature to the shared
-// per-user limiter callback used by the service layer. Unlike the old no-op
-// behavior, xray now consumes this callback to support dynamic speed updates.
+// SetSpeedLimitFunc stores the shared per-user limiter callback and refreshes
+// dispatcher speed limits. New connections pick up the limiter via Writer wrap.
 func (x *Xray) SetSpeedLimitFunc(fn func(string) *rate.Limiter) {
 	x.mu.Lock()
 	x.speedLimitFunc = fn
+	users := x.users
 	x.mu.Unlock()
-	x.updateBandwidthLimits(nil)
+	x.updateDispatcherLimits(users)
 }
 
 // SetDeviceLimitFunc is a no-op for xray — device limits are already
@@ -289,11 +307,9 @@ func (x *Xray) ClearGlobalDevices() {}
 // ─── User management (non-disruptive where possible) ────────────────────────
 
 // AddUsers merges new users into the running Xray instance.
-//
-// Xray's UserManager can report success while the effective inbound user table
-// is still stale for some transports/panel combinations. A full Xray restart is
-// therefore used whenever credentials change, matching the known-good initial
-// snapshot path and avoiding "restart fixes it" user drift.
+// Credential changes patch the inbound UserManager and close only the users
+// whose UUID changed. A full instance restart is the fallback when the
+// protocol has no UserManager.
 func (x *Xray) AddUsers(users []model.UserSpec) (int, error) {
 	x.mu.Lock()
 	if x.instance == nil {
@@ -322,24 +338,22 @@ func (x *Xray) AddUsers(users []model.UserSpec) (int, error) {
 		x.users = merged
 		x.mu.Unlock()
 		x.updateDispatcherLimits(merged)
-		x.updateBandwidthLimits(merged)
 		return 0, nil
 	}
 
-	nc := x.nodeConfig
-	t := x.tls
 	targetUsers := usersFromMap(userMap)
 	x.mu.Unlock()
 
-	if err := x.Start(nc, targetUsers, t); err != nil {
+	if err := x.syncUserTable(targetUsers); err != nil {
 		return 0, err
 	}
-	nlog.Core().Info("xray: users added via full restart", "added", len(toAdd), "total", len(targetUsers))
+	nlog.Core().Info("xray: users added", "added", len(toAdd), "total", len(targetUsers))
 	return len(toAdd), nil
 }
 
-// RemoveUsers removes users from the running Xray instance. See AddUsers for
-// why credential changes use a full restart instead of UserManager patching.
+// RemoveUsers removes users from the running Xray instance and closes their
+// live links. Other users stay connected. The instance stops only when the
+// last user is removed.
 func (x *Xray) RemoveUsers(users []model.UserSpec) (int, error) {
 	x.mu.Lock()
 	if x.instance == nil {
@@ -351,38 +365,46 @@ func (x *Xray) RemoveUsers(users []model.UserSpec) (int, error) {
 		removeSet[u.ID] = struct{}{}
 	}
 	var kept []model.UserSpec
-	removed := 0
+	var gone []model.UserSpec
 	for _, u := range x.users {
 		if _, rm := removeSet[u.ID]; rm {
-			removed++
+			gone = append(gone, u)
 		} else {
 			kept = append(kept, u)
 		}
 	}
-	if removed == 0 {
+	if len(gone) == 0 {
 		x.mu.Unlock()
 		return 0, nil
 	}
 
 	if len(kept) == 0 {
+		ld := x.limitDispatcher
+		emails := make([]string, 0, len(gone))
+		for _, u := range gone {
+			x.noteRemovedLocked(u)
+			emails = append(emails, userEmail(u.ID))
+		}
 		x.mu.Unlock()
+		if ld != nil {
+			for _, email := range emails {
+				ld.CloseUser(email)
+			}
+		}
 		x.Stop()
-		return removed, nil
+		return len(gone), nil
 	}
-
-	nc, t := x.nodeConfig, x.tls
 	x.mu.Unlock()
 
-	if err := x.Start(nc, kept, t); err != nil {
+	if err := x.syncUserTable(kept); err != nil {
 		return 0, err
 	}
-	nlog.Core().Info("xray: users removed via full restart", "removed", removed, "total", len(kept))
-	return removed, nil
+	nlog.Core().Info("xray: users removed", "removed", len(gone), "total", len(kept))
+	return len(gone), nil
 }
 
-// UpdateUsers replaces the entire user set. If only speed/device limits
-// changed, updates the dispatcher without restarting. Credential changes use a
-// full restart to guarantee the actual inbound user table matches the snapshot.
+// UpdateUsers replaces the entire user set. Limit-only changes update the
+// dispatcher. Membership changes patch UserManager and close removed users.
 func (x *Xray) UpdateUsers(users []model.UserSpec) (added, removed int, err error) {
 	x.mu.Lock()
 	if x.instance == nil {
@@ -397,20 +419,91 @@ func (x *Xray) UpdateUsers(users []model.UserSpec) (added, removed int, err erro
 		x.users = users
 		x.mu.Unlock()
 		x.updateDispatcherLimits(users)
-		x.updateBandwidthLimits(users)
 		nlog.Core().Info("xray: limits updated, kernel unchanged")
 		return 0, 0, nil
 	}
-
-	nc := x.nodeConfig
-	t := x.tls
 	x.mu.Unlock()
 
-	if err = x.Start(nc, users, t); err != nil {
+	if err = x.syncUserTable(users); err != nil {
 		return 0, 0, err
 	}
-	nlog.Core().Info("xray: users updated via full restart", "added", added, "removed", removed, "total", len(users))
+	nlog.Core().Info("xray: users updated", "added", added, "removed", removed, "total", len(users))
 	return
+}
+
+// syncUserTable applies a credential diff through the inbound UserManager and
+// interrupts links that belong to removed users. It restarts the instance
+// only when the protocol cannot patch users in place.
+func (x *Xray) syncUserTable(target []model.UserSpec) error {
+	x.mu.Lock()
+	if x.instance == nil {
+		x.mu.Unlock()
+		return fmt.Errorf("not running")
+	}
+	toAdd, toRemove := kernel.UserDiff(x.users, target)
+	if len(toAdd) == 0 && len(toRemove) == 0 {
+		x.users = append([]model.UserSpec(nil), target...)
+		x.mu.Unlock()
+		x.updateDispatcherLimits(target)
+		return nil
+	}
+
+	um, err := x.getUserManager()
+	if err != nil {
+		nc, t := x.nodeConfig, x.tls
+		x.mu.Unlock()
+		nlog.Core().Warn("xray: user table patch unavailable, restarting instance", "error", err)
+		return x.Start(nc, target, t)
+	}
+
+	emails := make([]string, 0, len(toRemove))
+	for _, u := range toRemove {
+		if err := um.RemoveUser(context.Background(), userEmail(u.ID)); err != nil {
+			nc, t := x.nodeConfig, x.tls
+			x.mu.Unlock()
+			nlog.Core().Warn("xray: RemoveUser failed, restarting instance", "id", u.ID, "error", err)
+			return x.Start(nc, target, t)
+		}
+		x.noteRemovedLocked(u)
+		emails = append(emails, userEmail(u.ID))
+	}
+	for _, u := range toAdd {
+		mem, err := toMemoryUser(x.protocol, x.nodeConfig, u)
+		if err != nil {
+			nc, t := x.nodeConfig, x.tls
+			x.mu.Unlock()
+			nlog.Core().Warn("xray: build user failed, restarting instance", "id", u.ID, "error", err)
+			return x.Start(nc, target, t)
+		}
+		if err := um.AddUser(context.Background(), mem); err != nil {
+			nc, t := x.nodeConfig, x.tls
+			x.mu.Unlock()
+			nlog.Core().Warn("xray: AddUser failed, restarting instance", "id", u.ID, "error", err)
+			return x.Start(nc, target, t)
+		}
+		delete(x.removedEmail, u.UUID)
+	}
+	x.users = append([]model.UserSpec(nil), target...)
+	ld := x.limitDispatcher
+	x.mu.Unlock()
+
+	x.updateDispatcherLimits(target)
+	if ld != nil {
+		for _, email := range emails {
+			ld.CloseUser(email)
+		}
+	}
+	return nil
+}
+
+func (x *Xray) noteRemovedLocked(u model.UserSpec) {
+	if u.UUID == "" {
+		return
+	}
+	if x.removedEmail == nil {
+		x.removedEmail = make(map[string]string)
+	}
+	x.removedEmail[u.UUID] = userEmail(u.ID)
 }
 
 var _ kernel.Kernel = (*Xray)(nil)
@@ -491,8 +584,9 @@ func toMemoryUser(proto string, nc *model.NodeSpec, u model.UserSpec) (*protocol
 
 	case "shadowsocks":
 		if strings.HasPrefix(nc.Cipher, "2022-blake3-") {
-			// 2022-blake3 multi-user mode
-			mu.Account = &ss2022.MemoryAccount{Key: u.UUID}
+			// 2022-blake3 multi-user mode. Xray stores the key as raw bytes and
+			// accepts either standard base64 or the original string.
+			mu.Account = &ss2022.MemoryAccount{Key: ss2022Key(u.UUID)}
 		} else {
 			// Traditional SS — build via getCipher path
 			ct := parseCipherType(nc.Cipher)
@@ -508,6 +602,14 @@ func toMemoryUser(proto string, nc *model.NodeSpec, u model.UserSpec) (*protocol
 	}
 
 	return mu, nil
+}
+
+func ss2022Key(key string) []byte {
+	raw, err := base64.StdEncoding.DecodeString(key)
+	if err != nil {
+		return []byte(key)
+	}
+	return raw
 }
 
 func usersFromMap(userMap map[int]model.UserSpec) []model.UserSpec {
@@ -530,7 +632,8 @@ func parseCipherType(cipher string) shadowsocks.CipherType {
 	case "xchacha20-ietf-poly1305", "xchacha20-poly1305":
 		return shadowsocks.CipherType_XCHACHA20_POLY1305
 	case "none", "plain":
-		return shadowsocks.CipherType_NONE
+		// Official Xray v26 dropped CipherType_NONE; unknown ciphers are rejected.
+		return shadowsocks.CipherType_UNKNOWN
 	default:
 		return shadowsocks.CipherType_AES_256_GCM
 	}
@@ -670,46 +773,13 @@ func (x *Xray) aggregateStats() (map[int][2]int64, error) {
 	return traffic, nil
 }
 
-// updateBandwidthLimits configures the patched xray-core bandwidth feature
-// with per-user speed limits in bytes per second.
-func (x *Xray) updateBandwidthLimits(users []model.UserSpec) {
-	x.mu.Lock()
-	inst := x.instance
-	fn := x.speedLimitFunc
-	currentUsers := x.users
-	x.mu.Unlock()
-	if inst == nil {
-		return
-	}
-	feat := inst.GetFeature(featurebandwidth.ManagerType())
-	if feat == nil {
-		return
-	}
-	bm, ok := feat.(featurebandwidth.Manager)
-	if !ok {
-		return
-	}
-	bm.Reset()
-	if users == nil {
-		users = currentUsers
-	}
-	for _, u := range users {
-		email := userEmail(u.ID)
-		if fn != nil {
-			bm.SetUserLimiter(email, fn(u.UUID))
-			continue
-		}
-		bps := int64(u.SpeedLimit) * 1_000_000 / 8
-		bm.SetUserLimit(email, bps)
-	}
-}
-
 // updateDispatcherLimits configures the LimitDispatcher with per-user
-// device-limit admission metadata only. Speed limits are enforced by the
-// patched xray-core bandwidth feature.
+// device-limit admission metadata and speed limiters. Speed is enforced by
+// wrapping transport.Link.Writer only, keeping mux/XUDP Reader intact.
 func (x *Xray) updateDispatcherLimits(users []model.UserSpec) {
 	x.mu.Lock()
 	ld := x.limitDispatcher
+	fn := x.speedLimitFunc
 	x.mu.Unlock()
 	if ld == nil {
 		return
@@ -717,6 +787,7 @@ func (x *Xray) updateDispatcherLimits(users []model.UserSpec) {
 
 	emailToUID := make(map[string]int, len(users)*2)
 	deviceLimits := make(map[string]int)
+	speedLimiters := make(map[string]*rate.Limiter)
 
 	for _, u := range users {
 		email := userEmail(u.ID)
@@ -726,9 +797,22 @@ func (x *Xray) updateDispatcherLimits(users []model.UserSpec) {
 			deviceLimits[email] = u.DeviceLimit
 			deviceLimits[u.UUID] = u.DeviceLimit
 		}
+		var lim *rate.Limiter
+		if fn != nil {
+			lim = fn(u.UUID)
+		} else if u.SpeedLimit > 0 {
+			bps := int64(u.SpeedLimit) * 1_000_000 / 8
+			if bps > 0 {
+				lim = rate.NewLimiter(rate.Limit(bps), int(bps))
+			}
+		}
+		if lim != nil {
+			speedLimiters[email] = lim
+			speedLimiters[u.UUID] = lim
+		}
 	}
 
-	ld.UpdateLimits(emailToUID, deviceLimits, nil)
+	ld.UpdateLimits(emailToUID, deviceLimits, speedLimiters)
 }
 
 // xrayCreationMu serialises xrayCore.New() + globalLimitDispatcher capture

@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1.7
 
 # Build stage
-FROM --platform=$BUILDPLATFORM golang:1.26-alpine AS builder
+FROM --platform=$BUILDPLATFORM golang:1.27.3-alpine AS builder
 
 ARG TARGETOS=linux
 ARG TARGETARCH=amd64
@@ -13,6 +13,8 @@ RUN apk add --no-cache git
 WORKDIR /build
 
 COPY go.mod go.sum ./
+ARG GOPROXY=https://proxy.golang.org,direct
+ENV GOPROXY=$GOPROXY
 RUN go mod download
 
 COPY . .
@@ -20,11 +22,11 @@ COPY . .
 RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -ldflags "-s -w \
     -X main.version=$VERSION \
     -X main.buildTime=$BUILD_TIME" \
-    -tags "with_quic with_utls with_wireguard with_clash_api" \
+    -tags "with_quic with_utls with_wireguard with_acme with_clash_api" \
     -o xboard-node ./cmd/xboard-node
 
 # Runtime stage — sing-box & xray-core are embedded as Go libraries
-FROM alpine:3.20
+FROM alpine:3.24
 
 RUN apk add --no-cache ca-certificates tzdata
 
@@ -40,7 +42,7 @@ WORKDIR /etc/XboardNode-Plus
 #     -e apiHost=https://panel.example.com \
 #     -e apiKey=YOUR_TOKEN \
 #     -e nodeID=1 \
-#     ghcr.io/xboardnext999/xboardnode-plus:latest
+#     jqjbot/botbot:latest
 #
 # Supported env vars:
 #   apiHost  / API_HOST    → panel URL

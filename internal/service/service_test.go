@@ -13,6 +13,7 @@ import (
 	"github.com/cedar2025/xboard-node/internal/kernel"
 	"github.com/cedar2025/xboard-node/internal/limiter"
 	"github.com/cedar2025/xboard-node/internal/model"
+	"github.com/cedar2025/xboard-node/internal/tracker"
 	"golang.org/x/time/rate"
 )
 
@@ -28,6 +29,7 @@ type fakeKernel struct {
 	updateCalls int
 	addCalls    int
 	removeCalls int
+	closed      []string
 
 	onUpdateUsers func([]model.UserSpec)
 	onAddUsers    func([]model.UserSpec)
@@ -97,7 +99,8 @@ func (f *fakeKernel) CloseConnection(ctx context.Context, connID string) error {
 	return nil
 }
 func (f *fakeKernel) CloseUserConnections(ctx context.Context, uuid string) error {
-	_, _ = ctx, uuid
+	_ = ctx
+	f.closed = append(f.closed, uuid)
 	return nil
 }
 func (f *fakeKernel) SetSpeedLimitFunc(fn func(uuid string) *rate.Limiter) { f.speedLimitFunc = fn }
@@ -114,6 +117,7 @@ func newTestService(k *fakeKernel) *Service {
 		kernelType:   "xray",
 		limiter:      sharedLimiter,
 		speedTracker: limiter.NewSpeedTracker(sharedLimiter),
+		tracker:      tracker.New(),
 		cert:         cert.NewManager(config.CertConfig{}),
 	}
 	k.SetSpeedLimitFunc(s.speedTracker.GetLimiter)
@@ -207,6 +211,212 @@ func TestApplyUserDeltaAddPreparesLimiterBeforeKernelUpdate(t *testing.T) {
 	}
 	if s.speedTracker.GetLimiter("uuid-new") == nil {
 		t.Fatal("expected limiter for delta-added user after successful update")
+	}
+}
+
+func TestApplyUserDeltaRemoveFallsBackToHotSwapWithoutHook(t *testing.T) {
+	k := &fakeKernel{running: true}
+	s := newTestService(k)
+	s.lastConfig = &model.NodeSpec{Protocol: "vless"}
+	s.updateUserState([]model.UserSpec{
+		{ID: 1, UUID: "uuid-1", SpeedLimit: 4},
+		{ID: 2, UUID: "uuid-2", SpeedLimit: 4},
+	})
+
+	s.applyUserDelta(context.Background(), "remove", []model.UserSpec{{ID: 1}})
+
+	if k.removeCalls != 1 {
+		t.Fatalf("RemoveUsers calls = %d, want 1 (hot-swap fallback)", k.removeCalls)
+	}
+	if k.startCalls != 0 {
+		t.Fatalf("kernel Start calls = %d, want 0 (kernel must not be restarted)", k.startCalls)
+	}
+	if len(s.lastUsers) != 1 || s.lastUsers[0].ID != 2 {
+		t.Fatalf("lastUsers = %#v, want only user 2", s.lastUsers)
+	}
+}
+
+func TestApplyUserDeltaAddKeepsOtherConnections(t *testing.T) {
+	k := &fakeKernel{running: true}
+	s := newTestService(k)
+	s.lastConfig = &model.NodeSpec{Protocol: "vless"}
+	s.updateUserState([]model.UserSpec{{ID: 1, UUID: "uuid-1"}})
+
+	s.applyUserDelta(context.Background(), "add", []model.UserSpec{{ID: 2, UUID: "uuid-2"}})
+
+	if k.addCalls != 1 {
+		t.Fatalf("AddUsers calls = %d, want 1", k.addCalls)
+	}
+	if k.startCalls != 0 {
+		t.Fatalf("kernel Start calls = %d, want 0", k.startCalls)
+	}
+	if len(k.closed) != 0 {
+		t.Fatalf("closed users = %v, want none", k.closed)
+	}
+}
+
+func TestApplyUserUpdateRemovalClosesOnlyRemovedUser(t *testing.T) {
+	k := &fakeKernel{running: true}
+	s := newTestService(k)
+	s.lastConfig = &model.NodeSpec{Protocol: "vless"}
+	s.updateUserState([]model.UserSpec{
+		{ID: 1, UUID: "uuid-1"},
+		{ID: 5, UUID: "uuid-5"},
+	})
+
+	s.applyUserUpdate(context.Background(), []model.UserSpec{{ID: 1, UUID: "uuid-1"}}, "", "test")
+
+	if k.updateCalls != 1 {
+		t.Fatalf("UpdateUsers calls = %d, want 1", k.updateCalls)
+	}
+	if k.startCalls != 0 {
+		t.Fatalf("kernel Start calls = %d, want 0", k.startCalls)
+	}
+	if len(k.closed) != 1 || k.closed[0] != "uuid-5" {
+		t.Fatalf("closed users = %v, want [uuid-5]", k.closed)
+	}
+	if len(s.lastUsers) != 1 || s.lastUsers[0].ID != 1 {
+		t.Fatalf("lastUsers = %#v, want only user 1", s.lastUsers)
+	}
+}
+
+func TestApplyUserUpdateNoChangeDoesNotClose(t *testing.T) {
+	k := &fakeKernel{running: true}
+	s := newTestService(k)
+	s.lastConfig = &model.NodeSpec{Protocol: "vless"}
+	users := []model.UserSpec{{ID: 1, UUID: "uuid-1"}}
+	s.updateUserState(users)
+
+	s.applyUserUpdate(context.Background(), users, "", "test")
+
+	if len(k.closed) != 0 {
+		t.Fatalf("closed users = %v, want none", k.closed)
+	}
+	if k.startCalls != 0 {
+		t.Fatalf("kernel Start calls = %d, want 0", k.startCalls)
+	}
+}
+
+func TestApplyUserUpdateFirstUsersDoesNotClose(t *testing.T) {
+	k := &fakeKernel{running: true}
+	s := newTestService(k)
+	s.lastConfig = &model.NodeSpec{Protocol: "vless"}
+
+	s.applyUserUpdate(context.Background(), []model.UserSpec{{ID: 1, UUID: "uuid-1"}}, "", "test")
+
+	if len(k.closed) != 0 {
+		t.Fatalf("closed users = %v, want none", k.closed)
+	}
+	if k.startCalls != 0 {
+		t.Fatalf("kernel Start calls = %d, want 0", k.startCalls)
+	}
+}
+
+func TestApplyUserDeltaAddNoChangeDoesNotRestart(t *testing.T) {
+	k := &fakeKernel{running: true}
+	s := newTestService(k)
+	s.lastConfig = &model.NodeSpec{Protocol: "vless"}
+	s.updateUserState([]model.UserSpec{{ID: 1, UUID: "uuid-1", SpeedLimit: 4}})
+
+	s.applyUserDelta(context.Background(), "add", []model.UserSpec{{ID: 1, UUID: "uuid-1", SpeedLimit: 4}})
+
+	if k.addCalls != 0 {
+		t.Fatalf("AddUsers calls = %d, want 0", k.addCalls)
+	}
+	if len(k.closed) != 0 {
+		t.Fatalf("closed users = %v, want none", k.closed)
+	}
+}
+
+func TestApplyUserDeltaRemoveClosesOnlyThatUser(t *testing.T) {
+	k := &fakeKernel{running: true}
+	s := newTestService(k)
+	s.lastConfig = &model.NodeSpec{Protocol: "vless"}
+	s.updateUserState([]model.UserSpec{
+		{ID: 1, UUID: "uuid-1"},
+		{ID: 2, UUID: "uuid-2"},
+	})
+
+	s.applyUserDelta(context.Background(), "remove", []model.UserSpec{{ID: 1}})
+
+	if k.removeCalls != 1 {
+		t.Fatalf("RemoveUsers calls = %d, want 1", k.removeCalls)
+	}
+	if k.startCalls != 0 {
+		t.Fatalf("kernel Start calls = %d, want 0", k.startCalls)
+	}
+	if !k.running {
+		t.Fatal("kernel must stay running")
+	}
+	if len(k.closed) != 1 || k.closed[0] != "uuid-1" {
+		t.Fatalf("closed users = %v, want [uuid-1]", k.closed)
+	}
+	if len(s.lastUsers) != 1 || s.lastUsers[0].ID != 2 {
+		t.Fatalf("lastUsers = %#v, want only user 2", s.lastUsers)
+	}
+}
+
+func TestApplyUserDeltaRemoveUnknownUserDoesNotRestart(t *testing.T) {
+	k := &fakeKernel{running: true}
+	s := newTestService(k)
+	s.lastConfig = &model.NodeSpec{Protocol: "vless"}
+	s.updateUserState([]model.UserSpec{{ID: 1, UUID: "uuid-1"}})
+
+	s.applyUserDelta(context.Background(), "remove", []model.UserSpec{{ID: 99}})
+
+	if k.removeCalls != 0 {
+		t.Fatalf("RemoveUsers calls = %d, want 0", k.removeCalls)
+	}
+	if k.startCalls != 0 {
+		t.Fatalf("kernel Start calls = %d, want 0", k.startCalls)
+	}
+	if len(k.closed) != 0 {
+		t.Fatalf("closed users = %v, want none", k.closed)
+	}
+	if len(s.lastUsers) != 1 {
+		t.Fatalf("lastUsers = %#v, want the original user", s.lastUsers)
+	}
+}
+
+func TestApplyUserDeltaRemoveDuplicateIsIgnored(t *testing.T) {
+	k := &fakeKernel{running: true}
+	s := newTestService(k)
+	s.lastConfig = &model.NodeSpec{Protocol: "vless"}
+	s.updateUserState([]model.UserSpec{
+		{ID: 1, UUID: "uuid-1"},
+		{ID: 2, UUID: "uuid-2"},
+	})
+
+	s.applyUserDelta(context.Background(), "remove", []model.UserSpec{{ID: 1}})
+	s.applyUserDelta(context.Background(), "remove", []model.UserSpec{{ID: 1}})
+
+	if k.removeCalls != 1 {
+		t.Fatalf("RemoveUsers calls = %d, want 1", k.removeCalls)
+	}
+	if len(k.closed) != 1 || k.closed[0] != "uuid-1" {
+		t.Fatalf("closed users = %v, want [uuid-1]", k.closed)
+	}
+}
+
+func TestApplyUserDeltaRemoveLastUserClosesWithoutRestart(t *testing.T) {
+	k := &fakeKernel{running: true}
+	s := newTestService(k)
+	s.lastConfig = &model.NodeSpec{Protocol: "vless"}
+	s.updateUserState([]model.UserSpec{{ID: 1, UUID: "uuid-1"}})
+
+	s.applyUserDelta(context.Background(), "remove", []model.UserSpec{{ID: 1}})
+
+	if k.startCalls != 0 {
+		t.Fatalf("kernel Start calls = %d, want 0", k.startCalls)
+	}
+	if k.removeCalls != 1 {
+		t.Fatalf("RemoveUsers calls = %d, want 1", k.removeCalls)
+	}
+	if len(k.closed) != 1 || k.closed[0] != "uuid-1" {
+		t.Fatalf("closed users = %v, want [uuid-1]", k.closed)
+	}
+	if len(s.lastUsers) != 0 {
+		t.Fatalf("lastUsers = %#v, want empty", s.lastUsers)
 	}
 }
 

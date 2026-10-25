@@ -39,7 +39,8 @@ func buildConfig(kcfg config.KernelConfig, nc *model.NodeSpec, users []model.Use
 
 	// Add default outbounds only if not already defined
 	if !tags["direct"] {
-		outbounds = append([]M{{"type": "direct", "tag": "direct"}}, outbounds...)
+		// IPv4-only VPS cannot dial AAAA results (googleapis etc.).
+		outbounds = append([]M{{"type": "direct", "tag": "direct", "domain_strategy": "prefer_ipv4"}}, outbounds...)
 	}
 	if !tags["block"] {
 		outbounds = append(outbounds, M{"type": "block", "tag": "block"})

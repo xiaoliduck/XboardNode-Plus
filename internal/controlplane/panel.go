@@ -44,6 +44,7 @@ func (p *PanelControlPlane) Initial(ctx context.Context, metricsFn func() map[st
 
 	bootstrap := Bootstrap{PushInterval: hs.Settings.PushInterval, PullInterval: hs.Settings.PullInterval}
 	if hs.WebSocket.Enabled && hs.WebSocket.WSURL != "" {
+		nlog.Core().Info("websocket enabled", "ws_url", hs.WebSocket.WSURL)
 		bootstrap.Push = p.newPushClient(metricsFn, events, statuses, hs.WebSocket.WSURL)
 		return bootstrap, nil
 	}

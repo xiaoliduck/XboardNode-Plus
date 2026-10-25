@@ -6,12 +6,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"sync"
-	"time"
 
 	box "github.com/sagernet/sing-box"
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/include"
-	singLog "github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing/common/auth"
 	singJSON "github.com/sagernet/sing/common/json"
@@ -25,15 +23,105 @@ import (
 	"github.com/cedar2025/xboard-node/internal/nlog"
 )
 
-// drainTimeout is how long stop() waits for in-flight connections to finish
-// naturally after closing all listen sockets, before hard-killing them.
-const drainTimeout = 5 * time.Second
+// Local copies of cedar2025/sing-box hot-update interfaces. Official sing-box
+// does not export these types; if an inbound implements UpdateUsers the
+// type-assert still succeeds. Otherwise swapOfficialUsers updates the
+// unexported protocol service. The instance restarts only when neither works.
+type updatableInbound[T any] interface {
+	UpdateUsers(users []T) error
+}
+
+type updatableShadowsocksInbound interface {
+	UpdateUsersByOptions(users []option.ShadowsocksUser) error
+}
+
+// hotUpdateInbounds reports whether every inbound accepted a credential swap.
+// A false result means the caller must restart the instance. Official
+// sing-box inbounds keep their user service unexported; swapOfficialUsers
+// updates that service in place so other users stay connected.
+func hotUpdateInbounds(im adapter.InboundManager, inbounds []option.Inbound) bool {
+	for _, inb := range inbounds {
+		existing, ok := im.Get(inb.Tag)
+		if !ok || existing.Type() != inb.Type {
+			return false
+		}
+		handled, err := applyInboundUsers(existing, inb)
+		if !handled || err != nil {
+			if err != nil {
+				nlog.Core().Warn("incremental user update failed", "tag", inb.Tag, "error", err)
+			}
+			return false
+		}
+	}
+	return true
+}
+
+func applyInboundUsers(existing adapter.Inbound, inb option.Inbound) (handled bool, err error) {
+	switch v := existing.(type) {
+	case updatableInbound[option.VMessUser]:
+		opts, ok := inb.Options.(*option.VMessInboundOptions)
+		if !ok {
+			return true, fmt.Errorf("unexpected vmess inbound options")
+		}
+		return true, v.UpdateUsers(opts.Users)
+	case updatableInbound[option.VLESSUser]:
+		opts, ok := inb.Options.(*option.VLESSInboundOptions)
+		if !ok {
+			return true, fmt.Errorf("unexpected vless inbound options")
+		}
+		return true, v.UpdateUsers(opts.Users)
+	case updatableInbound[option.TrojanUser]:
+		opts, ok := inb.Options.(*option.TrojanInboundOptions)
+		if !ok {
+			return true, fmt.Errorf("unexpected trojan inbound options")
+		}
+		return true, v.UpdateUsers(opts.Users)
+	case updatableInbound[option.Hysteria2User]:
+		opts, ok := inb.Options.(*option.Hysteria2InboundOptions)
+		if !ok {
+			return true, fmt.Errorf("unexpected hysteria2 inbound options")
+		}
+		return true, v.UpdateUsers(opts.Users)
+	case updatableShadowsocksInbound:
+		opts, ok := inb.Options.(*option.ShadowsocksInboundOptions)
+		if !ok {
+			return true, fmt.Errorf("unexpected shadowsocks inbound options")
+		}
+		return true, v.UpdateUsersByOptions(opts.Users)
+	case updatableInbound[option.TUICUser]:
+		opts, ok := inb.Options.(*option.TUICInboundOptions)
+		if !ok {
+			return true, fmt.Errorf("unexpected tuic inbound options")
+		}
+		return true, v.UpdateUsers(opts.Users)
+	case updatableInbound[option.AnyTLSUser]:
+		opts, ok := inb.Options.(*option.AnyTLSInboundOptions)
+		if !ok {
+			return true, fmt.Errorf("unexpected anytls inbound options")
+		}
+		return true, v.UpdateUsers(opts.Users)
+	case updatableInbound[auth.User]:
+		switch opts := inb.Options.(type) {
+		case *option.NaiveInboundOptions:
+			return true, v.UpdateUsers(opts.Users)
+		case *option.SocksInboundOptions:
+			return true, v.UpdateUsers(opts.Users)
+		case *option.HTTPMixedInboundOptions:
+			return true, v.UpdateUsers(opts.Users)
+		default:
+			return false, nil
+		}
+	default:
+		return swapOfficialUsers(existing, inb)
+	}
+}
 
 // SingBox implements kernel.Kernel by embedding sing-box as a Go library.
 //
-// User operations (AddUsers/RemoveUsers/UpdateUsers) use sing-box's native
-// UpdatableInbound interface, which hot-swaps user credentials without
-// restarting listeners — zero connection disruption.
+// User operations try UpdateUsers when an inbound implements it. Official
+// sing-box 1.14.4 keeps that method on an unexported service, which
+// swapOfficialUsers updates in place. Listener and route changes still
+// restart the instance, because InboundManager no longer exposes Remove or Close.
 type SingBox struct {
 	cfg config.KernelConfig
 
@@ -86,14 +174,17 @@ func (s *SingBox) Capabilities() kernel.Capabilities {
 func (s *SingBox) Protocols() []string {
 	return []string{
 		"vmess", "vless", "trojan", "shadowsocks",
-		"hysteria", "hysteria2", "tuic", "naive", "socks", "http", "anytls", "mieru",
+		"hysteria", "hysteria2", "tuic", "naive", "socks", "http", "anytls",
 	}
 }
 
 func (s *SingBox) Start(nodeConfig *model.NodeSpec, users []model.UserSpec, tls kernel.TLSCert) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.startLocked(nodeConfig, users, tls)
+}
 
+func (s *SingBox) startLocked(nodeConfig *model.NodeSpec, users []model.UserSpec, tls kernel.TLSCert) error {
 	cfgMap := buildConfig(s.cfg, nodeConfig, users, tls)
 	data, err := json.Marshal(cfgMap)
 	if err != nil {
@@ -114,8 +205,6 @@ func (s *SingBox) Start(nodeConfig *model.NodeSpec, users []model.UserSpec, tls 
 	// Save old state before creating the new instance.
 	oldBox := s.box
 	oldCancel := s.cancel
-	oldCtx := s.ctx
-	oldTracker := s.connTracker
 
 	instance, err := box.New(box.Options{
 		Context: ctx,
@@ -126,9 +215,21 @@ func (s *SingBox) Start(nodeConfig *model.NodeSpec, users []model.UserSpec, tls 
 		return fmt.Errorf("create sing-box instance: %w", err)
 	}
 
+	// 1.14.4 closes listen sockets only from Box.Close. Release the previous
+	// instance before binding, otherwise the new process cannot take the port.
+	if oldBox != nil {
+		_ = oldBox.Close()
+		if oldCancel != nil {
+			oldCancel()
+		}
+	}
+
 	if err := instance.Start(); err != nil {
-		instance.Close()
+		_ = instance.Close()
 		cancel()
+		s.box = nil
+		s.ctx = nil
+		s.cancel = nil
 		return fmt.Errorf("start sing-box: %w", err)
 	}
 
@@ -153,41 +254,8 @@ func (s *SingBox) Start(nodeConfig *model.NodeSpec, users []model.UserSpec, tls 
 	s.trackerRegistered = false
 	s.registerTracker(ctx)
 
-	// Recycle old instance in background — drain then close.
-	if oldBox != nil {
-		go recycleOldBox(oldBox, oldCancel, oldCtx, oldTracker)
-	}
-
 	nlog.Core().Debug("sing-box started", "users", len(users))
 	return nil
-}
-
-// recycleOldBox gracefully shuts down a previous sing-box instance in the
-// background. It closes listen sockets first, waits for connections to drain,
-// then hard-closes. This avoids blocking the new instance's startup.
-func recycleOldBox(oldBox *box.Box, oldCancel context.CancelFunc, oldCtx context.Context, oldTracker *ConnTracker) {
-	// Step 1: close listen sockets so no new connections arrive on old ports.
-	if im := service.FromContext[adapter.InboundManager](oldCtx); im != nil {
-		_ = im.Close()
-	}
-
-	// Step 2: drain in-flight connections (best-effort).
-	if oldTracker != nil {
-		deadline := time.Now().Add(drainTimeout)
-		for time.Now().Before(deadline) {
-			if oldTracker.ActiveCount() == 0 {
-				break
-			}
-			time.Sleep(100 * time.Millisecond)
-		}
-	}
-
-	// Step 3: hard-close everything.
-	oldBox.Close()
-	if oldCancel != nil {
-		oldCancel()
-	}
-	nlog.Core().Debug("sing-box: old instance recycled")
 }
 
 // Reload hot-swaps the inbound users and routing rules without restarting the box.
@@ -199,6 +267,13 @@ func (s *SingBox) Reload(nodeConfig *model.NodeSpec, users []model.UserSpec, tls
 
 	if s.box == nil {
 		return fmt.Errorf("not running")
+	}
+
+	// Official sing-box has no Router.UpdateRules. Route/outbound changes
+	// require a new instance; inbound-only user updates stay hot.
+	if routingConfigChanged(s.nodeConfig, nodeConfig) {
+		nlog.Core().Info("sing-box routing or outbounds changed, restarting instance")
+		return s.startLocked(nodeConfig, users, tls)
 	}
 
 	cfgMap := buildConfig(s.cfg, nodeConfig, users, tls)
@@ -217,89 +292,13 @@ func (s *SingBox) Reload(nodeConfig *model.NodeSpec, users []model.UserSpec, tls
 		return fmt.Errorf("inbound manager not available")
 	}
 
-	router := service.FromContext[adapter.Router](s.ctx)
-	if router == nil {
-		return fmt.Errorf("router not available")
-	}
-
-	// Update routing rules
-	if err := router.UpdateRules(opts.Route.Rules, opts.Route.RuleSet); err != nil {
-		nlog.Core().Debug("routing reload failed", "error", err)
-	} else {
-		nlog.Core().Debug("sing-box routing reloaded")
-	}
-
-	nopFactory := singLog.NewNOPFactory()
-
 	// Configuration hash check for inbound reconstruction
 	tlsChanged := !bytes.Equal(s.tls.CertPEM, tls.CertPEM) || !bytes.Equal(s.tls.KeyPEM, tls.KeyPEM)
 	configChanged := tlsChanged || s.nodeConfig == nil || kernel.ComputeHash(nodeConfig, users) != kernel.ComputeHash(s.nodeConfig, s.users)
 
-	for _, inb := range opts.Inbounds {
-		tag := inb.Tag
-		if !configChanged {
-			if existing, ok := im.Get(tag); ok && existing.Type() == inb.Type {
-				var err error
-				switch v := existing.(type) {
-				case adapter.UpdatableInbound[option.VMessUser]:
-					if opts, ok := inb.Options.(*option.VMessInboundOptions); ok {
-						err = v.UpdateUsers(opts.Users)
-					}
-				case adapter.UpdatableInbound[option.VLESSUser]:
-					if opts, ok := inb.Options.(*option.VLESSInboundOptions); ok {
-						err = v.UpdateUsers(opts.Users)
-					}
-				case adapter.UpdatableInbound[option.TrojanUser]:
-					if opts, ok := inb.Options.(*option.TrojanInboundOptions); ok {
-						err = v.UpdateUsers(opts.Users)
-					}
-				case adapter.UpdatableInbound[option.Hysteria2User]:
-					if opts, ok := inb.Options.(*option.Hysteria2InboundOptions); ok {
-						err = v.UpdateUsers(opts.Users)
-					}
-				case adapter.UpdatableShadowsocksInbound:
-					if opts, ok := inb.Options.(*option.ShadowsocksInboundOptions); ok {
-						err = v.UpdateUsersByOptions(opts.Users)
-					}
-				case adapter.UpdatableInbound[option.TUICUser]:
-					if opts, ok := inb.Options.(*option.TUICInboundOptions); ok {
-						err = v.UpdateUsers(opts.Users)
-					}
-				case adapter.UpdatableInbound[option.AnyTLSUser]:
-					if opts, ok := inb.Options.(*option.AnyTLSInboundOptions); ok {
-						err = v.UpdateUsers(opts.Users)
-					}
-				case adapter.UpdatableInbound[option.MieruUser]:
-					if opts, ok := inb.Options.(*option.MieruInboundOptions); ok {
-						err = v.UpdateUsers(opts.Users)
-					}
-				case adapter.UpdatableInbound[auth.User]:
-					switch opts := inb.Options.(type) {
-					case *option.NaiveInboundOptions:
-						err = v.UpdateUsers(opts.Users)
-					case *option.SocksInboundOptions:
-						err = v.UpdateUsers(opts.Users)
-					case *option.HTTPMixedInboundOptions:
-						err = v.UpdateUsers(opts.Users)
-					}
-				}
-				if err == nil {
-					continue
-				}
-				nlog.Core().Warn("incremental update failed, falling back to recreate", "tag", tag, "error", err)
-			}
-		}
-
-		// Config mismatch or incremental update failure: Reconstruct Inbound.
-		// Remove the existing inbound first so im.Create() can bind the same port.
-		// im.Create() cannot atomically swap a TCP listener — it tries to start the
-		// new socket before the old one is closed, causing "address already in use".
-		// The brief listen gap (< 1 ms) is far less disruptive than a full restart.
-		_ = im.Remove(tag) // ignore error when tag doesn't exist yet
-		logger := nopFactory.NewLogger(fmt.Sprintf("inbound/%s[%s]", inb.Type, tag))
-		if err := im.Create(s.ctx, router, logger, tag, inb.Type, inb.Options); err != nil {
-			return fmt.Errorf("recreate inbound %s: %w", tag, err)
-		}
+	if configChanged || !hotUpdateInbounds(im, opts.Inbounds) {
+		nlog.Core().Info("sing-box inbound cannot be replaced in place, restarting instance")
+		return s.startLocked(nodeConfig, users, tls)
 	}
 
 	// Trackers remain registered on the Router (which survives ReloadUsers).
@@ -343,27 +342,9 @@ func (s *SingBox) stop() {
 		return
 	}
 
-	// Step 1: close all listen sockets so no new connections are accepted.
-	// im.Close() sets m.started=false so the subsequent box.Close() call is a no-op
-	// for inbounds (avoids double-close), but box.Close() still tears down routers
-	// and outbounds.
-	if im := service.FromContext[adapter.InboundManager](s.ctx); im != nil {
-		_ = im.Close()
-	}
-
-	// Step 2: wait for in-flight connections to drain naturally (best-effort).
-	if s.connTracker != nil {
-		deadline := time.Now().Add(drainTimeout)
-		for time.Now().Before(deadline) {
-			if s.connTracker.ActiveCount() == 0 {
-				break
-			}
-			time.Sleep(100 * time.Millisecond)
-		}
-	}
-
-	// Step 3: hard-close everything that is still open.
-	s.box.Close()
+	// Box.Close tears down the scope, including listen sockets. 1.14.4 has no
+	// separate inbound Close, so listeners and the rest stop together.
+	_ = s.box.Close()
 	s.box = nil
 	if s.cancel != nil {
 		s.cancel()
@@ -427,7 +408,8 @@ func (s *SingBox) ClearGlobalDevices() {
 
 // ─── User management (non-disruptive) ───────────────────────────────────────
 
-// AddUsers hot-swaps users into running inbounds. Zero connection disruption.
+// AddUsers applies users to running inbounds, restarting the instance when
+// the inbound cannot hot-swap credentials.
 func (s *SingBox) AddUsers(users []model.UserSpec) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -458,7 +440,8 @@ func (s *SingBox) AddUsers(users []model.UserSpec) (int, error) {
 	return len(toAdd), nil
 }
 
-// RemoveUsers hot-swaps users out of running inbounds. Zero connection disruption
+// RemoveUsers drops users from running inbounds, restarting the instance when
+// the inbound cannot hot-swap credentials.
 // for remaining users.
 func (s *SingBox) RemoveUsers(users []model.UserSpec) (int, error) {
 	s.mu.Lock()
@@ -492,7 +475,8 @@ func (s *SingBox) RemoveUsers(users []model.UserSpec) (int, error) {
 	return removed, nil
 }
 
-// UpdateUsers replaces the entire user set atomically via hot-swap.
+// UpdateUsers replaces the entire user set, restarting the instance when
+// inbounds cannot hot-swap credentials.
 func (s *SingBox) UpdateUsers(users []model.UserSpec) (added, removed int, err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -520,8 +504,8 @@ func (s *SingBox) UpdateUsers(users []model.UserSpec) (added, removed int, err e
 	return
 }
 
-// reloadInboundsLocked hot-swaps inbound users using UpdatableInbound.
-// Must be called with s.mu held.
+// reloadInboundsLocked applies inbound users using UpdatableInbound.
+// Must be called with s.mu held. Official sing-box restarts instead.
 func (s *SingBox) reloadInboundsLocked(users []model.UserSpec) error {
 	cfgMap := buildConfig(s.cfg, s.nodeConfig, users, s.tls)
 	data, err := json.Marshal(cfgMap)
@@ -539,71 +523,9 @@ func (s *SingBox) reloadInboundsLocked(users []model.UserSpec) error {
 		return fmt.Errorf("inbound manager not available")
 	}
 
-	router := service.FromContext[adapter.Router](s.ctx)
-	if router == nil {
-		return fmt.Errorf("router not available")
-	}
-
-	nopFactory := singLog.NewNOPFactory()
-
-	for _, inb := range opts.Inbounds {
-		tag := inb.Tag
-		if existing, ok := im.Get(tag); ok && existing.Type() == inb.Type {
-			var err error
-			switch v := existing.(type) {
-			case adapter.UpdatableInbound[option.VMessUser]:
-				if opts, ok := inb.Options.(*option.VMessInboundOptions); ok {
-					err = v.UpdateUsers(opts.Users)
-				}
-			case adapter.UpdatableInbound[option.VLESSUser]:
-				if opts, ok := inb.Options.(*option.VLESSInboundOptions); ok {
-					err = v.UpdateUsers(opts.Users)
-				}
-			case adapter.UpdatableInbound[option.TrojanUser]:
-				if opts, ok := inb.Options.(*option.TrojanInboundOptions); ok {
-					err = v.UpdateUsers(opts.Users)
-				}
-			case adapter.UpdatableInbound[option.Hysteria2User]:
-				if opts, ok := inb.Options.(*option.Hysteria2InboundOptions); ok {
-					err = v.UpdateUsers(opts.Users)
-				}
-			case adapter.UpdatableShadowsocksInbound:
-				if opts, ok := inb.Options.(*option.ShadowsocksInboundOptions); ok {
-					err = v.UpdateUsersByOptions(opts.Users)
-				}
-			case adapter.UpdatableInbound[option.TUICUser]:
-				if opts, ok := inb.Options.(*option.TUICInboundOptions); ok {
-					err = v.UpdateUsers(opts.Users)
-				}
-			case adapter.UpdatableInbound[option.AnyTLSUser]:
-				if opts, ok := inb.Options.(*option.AnyTLSInboundOptions); ok {
-					err = v.UpdateUsers(opts.Users)
-				}
-			case adapter.UpdatableInbound[option.MieruUser]:
-				if opts, ok := inb.Options.(*option.MieruInboundOptions); ok {
-					err = v.UpdateUsers(opts.Users)
-				}
-			case adapter.UpdatableInbound[auth.User]:
-				switch opts := inb.Options.(type) {
-				case *option.NaiveInboundOptions:
-					err = v.UpdateUsers(opts.Users)
-				case *option.SocksInboundOptions:
-					err = v.UpdateUsers(opts.Users)
-				case *option.HTTPMixedInboundOptions:
-					err = v.UpdateUsers(opts.Users)
-				}
-			}
-			if err == nil {
-				continue
-			}
-			nlog.Core().Warn("incremental update failed, recreating inbound", "tag", tag, "error", err)
-		}
-
-		_ = im.Remove(tag)
-		logger := nopFactory.NewLogger(fmt.Sprintf("inbound/%s[%s]", inb.Type, tag))
-		if err := im.Create(s.ctx, router, logger, tag, inb.Type, inb.Options); err != nil {
-			return fmt.Errorf("recreate inbound %s: %w", tag, err)
-		}
+	if !hotUpdateInbounds(im, opts.Inbounds) {
+		nlog.Core().Info("sing-box inbound cannot hot-swap users, restarting instance")
+		return s.startLocked(s.nodeConfig, users, s.tls)
 	}
 
 	if s.connTracker != nil {
@@ -657,6 +579,21 @@ func (s *SingBox) CloseUserConnections(_ context.Context, uuid string) error {
 // buildUserMap creates a UUID→userID mapping used by ConnTracker to attribute
 // connections to the correct user. All sing-box protocols use the user's UUID
 // as the inbound name/username, so this covers every protocol.
+func routingConfigChanged(old, neu *model.NodeSpec) bool {
+	if old == nil || neu == nil {
+		return old != neu
+	}
+	type routing struct {
+		Routes           []model.RouteRule
+		CustomOutbounds  []model.OutboundConfig
+		CustomRoutes     []map[string]any
+		CustomRouteRules []model.CustomRouteRule
+	}
+	a, _ := json.Marshal(routing{old.Routes, old.CustomOutbounds, old.CustomRoutes, old.CustomRouteRules})
+	b, _ := json.Marshal(routing{neu.Routes, neu.CustomOutbounds, neu.CustomRoutes, neu.CustomRouteRules})
+	return !bytes.Equal(a, b)
+}
+
 func buildUserMap(users []model.UserSpec) map[string]int {
 	m := make(map[string]int, len(users))
 	for _, u := range users {

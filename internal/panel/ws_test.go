@@ -289,3 +289,31 @@ func TestWSClient_UserDeltaEvent(t *testing.T) {
 		t.Errorf("unexpected DeltaUsers: %+v", received[0].DeltaUsers)
 	}
 }
+
+func TestNormalizeWSURL(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		in, want string
+	}{
+		{"wss://o.li.sb", "wss://o.li.sb"},
+		{"wss://o.li.sb/ws", "wss://o.li.sb/ws"},
+		{"https://o.li.sb", "wss://o.li.sb"},
+		{"https://o.li.sb/ws", "wss://o.li.sb/ws"},
+		{"http://panel.example.com:8076", "ws://panel.example.com:8076"},
+		{"  wss://o.li.sb/ws  ", "wss://o.li.sb/ws"},
+		{"wss：//o.li.sb/ws", "wss://o.li.sb/ws"},
+	}
+	for _, tt := range tests {
+		got, err := normalizeWSURL(tt.in)
+		if err != nil {
+			t.Errorf("normalizeWSURL(%q) error = %v", tt.in, err)
+			continue
+		}
+		if got != tt.want {
+			t.Errorf("normalizeWSURL(%q) = %q, want %q", tt.in, got, tt.want)
+		}
+	}
+	if _, err := normalizeWSURL("o.li.sb"); err == nil {
+		t.Fatal("expected error for missing scheme")
+	}
+}

@@ -545,6 +545,11 @@ func (s *Service) drainMachineMailbox(ctx context.Context) {
 		return
 	}
 	state := s.machineMailbox.DrainIfReady()
+	if state.HasConfig || state.HasUsers || state.HasDevices || state.NeedsReconcile {
+		nlog.Core().Debug("machine mailbox drained",
+			"config", state.HasConfig, "users", state.HasUsers,
+			"devices", state.HasDevices, "reconcile", state.NeedsReconcile)
+	}
 	if state.HasConfig {
 		s.handleWSEvent(ctx, controlplane.Event{Type: controlplane.EventSyncConfig, Config: state.Config})
 	}
@@ -634,9 +639,9 @@ func (s *Service) wsDiscovery(ctx context.Context) {
 	if s.wsClient == nil {
 		needsCheck = true
 		nlog.Core().Debug("push discovery: no push client, checking if control plane enabled push")
-	} else if !s.wsDisconnectAt.IsZero() && time.Since(s.wsDisconnectAt) > 10*time.Minute {
+	} else if !s.wsDisconnectAt.IsZero() && time.Since(s.wsDisconnectAt) > 30*time.Second {
 		needsCheck = true
-		nlog.Core().Debug("push discovery: push disconnected for >10min, re-checking")
+		nlog.Core().Debug("push discovery: push disconnected, re-checking handshake")
 	}
 	if !needsCheck {
 		return
@@ -652,8 +657,11 @@ func (s *Service) wsDiscovery(ctx context.Context) {
 	}
 
 	if pushClient != nil {
-		if s.wsClient == nil {
-			nlog.Core().Info("push discovery: control plane enabled push, creating client")
+		if s.wsClient == nil || !s.wsClient.IsConnected() {
+			nlog.Core().Info("push discovery: (re)starting push client from handshake")
+			if s.wsCancel != nil {
+				s.wsCancel()
+			}
 			s.metricsMu.Lock()
 			s.wsClient = pushClient
 			s.wsDisconnectAt = time.Time{}
@@ -709,6 +717,7 @@ func (s *Service) handleWSEvent(ctx context.Context, event controlplane.Event) {
 		}
 		newHash := computeUserHash(event.Users)
 		if newHash == s.lastUserHash {
+			s.logUsersSetSkipped(len(event.Users))
 			return
 		}
 		if s.nodeLog != nil {
@@ -1129,6 +1138,14 @@ func (s *Service) applyUserUpdateWithDiagnostics(ctx context.Context, users []mo
 		return
 	}
 
+	// Close only the users who left this snapshot. Adds and limit changes
+	// stay on the hot path, and other users' connections are left alone.
+	_, removedIDs := diffUsers(s.lastUsers, users)
+	gone := usersByIDs(s.lastUsers, removedIDs)
+	if len(gone) > 0 {
+		s.trackAndEnforce(ctx)
+	}
+
 	prevUsers, prevHash := s.prepareUserState(users)
 	added, removed, err := s.kernel.UpdateUsers(users)
 	if err != nil {
@@ -1142,6 +1159,9 @@ func (s *Service) applyUserUpdateWithDiagnostics(ctx context.Context, users []mo
 		s.finishUserSync(diag, "failed", reloadStatus)
 		return
 	}
+	if len(gone) > 0 {
+		s.disconnectUsers(ctx, gone)
+	}
 	if newHash != "" {
 		s.lastUserHash = newHash
 	}
@@ -1151,8 +1171,92 @@ func (s *Service) applyUserUpdateWithDiagnostics(ctx context.Context, users []mo
 	s.finishUserSync(diag, "success", "skipped")
 }
 
-// applyUserDelta applies an incremental user change (add or remove) directly
-// via the kernel's atomic user API. Kernel updates run before updateUserState.
+// diffUsers returns the user IDs that only exist in new (added) and only in
+// old (removed).
+func diffUsers(oldUsers, newUsers []model.UserSpec) (added, removed []int) {
+	oldIDs := make(map[int]struct{}, len(oldUsers))
+	for _, u := range oldUsers {
+		oldIDs[u.ID] = struct{}{}
+	}
+	newIDs := make(map[int]struct{}, len(newUsers))
+	for _, u := range newUsers {
+		newIDs[u.ID] = struct{}{}
+	}
+	for _, u := range newUsers {
+		if _, ok := oldIDs[u.ID]; !ok {
+			added = append(added, u.ID)
+		}
+	}
+	for _, u := range oldUsers {
+		if _, ok := newIDs[u.ID]; !ok {
+			removed = append(removed, u.ID)
+		}
+	}
+	return
+}
+
+// usersByIDs returns the users whose IDs are in ids, preserving base order.
+func usersByIDs(base []model.UserSpec, ids []int) []model.UserSpec {
+	if len(ids) == 0 || len(base) == 0 {
+		return nil
+	}
+	want := make(map[int]struct{}, len(ids))
+	for _, id := range ids {
+		want[id] = struct{}{}
+	}
+	out := make([]model.UserSpec, 0, len(ids))
+	for _, user := range base {
+		if _, ok := want[user.ID]; ok {
+			out = append(out, user)
+		}
+	}
+	return out
+}
+
+// disconnectUsers closes live connections for the given users and leaves
+// every other connection on this node running.
+func (s *Service) disconnectUsers(ctx context.Context, users []model.UserSpec) {
+	for _, user := range users {
+		if user.UUID == "" {
+			continue
+		}
+		if err := s.kernel.CloseUserConnections(ctx, user.UUID); err != nil {
+			nlog.Core().Warn("close removed user connections failed", "id", user.ID, "error", err)
+		}
+	}
+}
+
+// logUsersSetSkipped explains why an incoming full user set produced no action.
+func (s *Service) logUsersSetSkipped(incoming int) {
+	ids := make([]string, 0, len(s.lastUsers))
+	for _, u := range s.lastUsers {
+		ids = append(ids, fmt.Sprintf("%d", u.ID))
+	}
+	msg := fmt.Sprintf("user set unchanged, skipping (incoming=%d local=%d ids=%s)",
+		incoming, len(s.lastUsers), strings.Join(ids, ","))
+	if s.nodeLog != nil {
+		s.nodeLog.Debug(msg)
+		return
+	}
+	nlog.Core().Debug(msg)
+}
+
+// logDeltaEvent emits a debug line for a user delta that did not change state.
+func (s *Service) logDeltaEvent(action string, deltaUsers []model.UserSpec, why string) {
+	ids := make([]string, 0, len(deltaUsers))
+	for _, u := range deltaUsers {
+		ids = append(ids, fmt.Sprintf("%d", u.ID))
+	}
+	if s.nodeLog != nil {
+		s.nodeLog.Debug("user delta ignored", "action", action, "ids", strings.Join(ids, ","), "why", why)
+		return
+	}
+	nlog.Core().Debug("user delta ignored", "action", action, "ids", strings.Join(ids, ","), "why", why)
+}
+
+// applyUserDelta applies an incremental user change (add or remove).
+// A repeated delta that does not change the local set is ignored. Removal
+// closes only that user's connections.
 func (s *Service) applyUserDelta(ctx context.Context, action string, deltaUsers []model.UserSpec) {
 	switch action {
 	case "add":
@@ -1161,14 +1265,20 @@ func (s *Service) applyUserDelta(ctx context.Context, action string, deltaUsers 
 			return
 		}
 		merged := mergeUsers(s.lastUsers, deltaUsers)
+		if computeUserHash(merged) == s.lastUserHash {
+			s.logDeltaEvent("add", deltaUsers, "no change after merge, skipping")
+			return
+		}
 
 		if !s.ensureRunning() {
 			return
 		}
 
+		var replaced []model.UserSpec
 		for _, delta := range deltaUsers {
 			for _, old := range s.lastUsers {
 				if old.ID == delta.ID && old.UUID != delta.UUID {
+					replaced = append(replaced, old)
 					s.kernel.RemoveUsers([]model.UserSpec{old})
 					break
 				}
@@ -1185,6 +1295,9 @@ func (s *Service) applyUserDelta(ctx context.Context, action string, deltaUsers 
 				return
 			}
 		}
+		if len(replaced) > 0 {
+			s.disconnectUsers(ctx, replaced)
+		}
 		if s.nodeLog != nil && added > 0 {
 			s.nodeLog.Info(fmt.Sprintf("users added: +%d", added))
 		}
@@ -1195,14 +1308,23 @@ func (s *Service) applyUserDelta(ctx context.Context, action string, deltaUsers 
 			return
 		}
 		filtered := subtractUsers(s.lastUsers, deltaUsers)
-
-		if !s.kernel.IsRunning() {
+		_, removedIDs := diffUsers(s.lastUsers, filtered)
+		gone := usersByIDs(s.lastUsers, removedIDs)
+		if len(gone) == 0 {
+			s.logDeltaEvent("remove", deltaUsers,
+				fmt.Sprintf("no local user matched (%d known), skipping", len(s.lastUsers)))
 			return
 		}
 
+		if !s.kernel.IsRunning() || s.lastConfig == nil {
+			s.logDeltaEvent("remove", deltaUsers,
+				fmt.Sprintf("kernel not ready (running=%v config=%v), skipping", s.kernel.IsRunning(), s.lastConfig != nil))
+			return
+		}
+
+		s.trackAndEnforce(ctx)
 		prevUsers, prevHash := s.prepareUserState(filtered)
-		removed, err := s.kernel.RemoveUsers(deltaUsers)
-		if err != nil {
+		if _, err := s.kernel.RemoveUsers(deltaUsers); err != nil {
 			nlog.Core().Warn(fmt.Sprintf("RemoveUsers failed: %v, falling back to UpdateUsers", err))
 			if _, _, err := s.kernel.UpdateUsers(filtered); err != nil {
 				nlog.Core().Error(fmt.Sprintf("UpdateUsers fallback failed: %v", err))
@@ -1210,8 +1332,9 @@ func (s *Service) applyUserDelta(ctx context.Context, action string, deltaUsers 
 				return
 			}
 		}
-		if s.nodeLog != nil && removed > 0 {
-			s.nodeLog.Info(fmt.Sprintf("users removed: -%d", removed))
+		s.disconnectUsers(ctx, gone)
+		if s.nodeLog != nil {
+			s.nodeLog.Info(fmt.Sprintf("users removed: -%d", len(gone)))
 		}
 
 	default:

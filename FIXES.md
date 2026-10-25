@@ -229,3 +229,22 @@ go test ./...
 - `inbound_user_update=reconciled`
 
 这些字段可以快速判断是面板返回异常、同步快照异常，还是 Xray inbound 热更新失败。
+
+## 1.23 依赖升级
+
+- 运行镜像从已停止安全支持的 `alpine:3.20` 升级到 `alpine:3.24`。
+- CI / Docker 构建 Go 升级到 `1.27.3`（`toolchain go1.27.3`）。
+- `sing-box` 从 cedar fork 的 `v1.14.0-alpha.2` 升级到官方 `v1.14.4`。
+- `xray-core` 从 cedar fork（约 `v26.3.27` + bandwidth 补丁）升级到官方 `v26.10.21`（Go module 伪版本 `v1.260327.1-0.20261021115930-1b1647cd9ddf`）。
+- Xray 限速改为在节点 `LimitDispatcher` 包装 `Writer`，不再依赖内核 fork 的 `features/bandwidth`。
+- 官方 Xray 已移除 `CipherType_NONE`，`none`/`plain` 映射为 `CipherType_UNKNOWN`。
+- 官方 sing-box 没有 `Router.UpdateRules` 和 Mieru inbound：路由/出站变化时重启实例；`mieru` 不再作为 inbound 协议。
+- sing-box 1.14.4 的 `InboundManager` 去掉了 `Remove` / `Close`。官方入站的用户表在未导出的 protocol service 上原地更新；只有这个协议更新不了时才重启该节点的实例，并先关掉旧实例再绑定端口。
+- ACME 库 `certmagic` 升级到 `v0.25.4`；`golang.org/x/net` 升级到 `v0.61.0`，`golang.org/x/crypto` 到 `v0.58.0`。
+- Docker 镜像发布到 `jqjbot/botbot`（Docker Hub）。
+
+## 用户移除后仍可使用
+
+流量超额或过期的 `sync.user.delta` 以前只热更新入站用户表，已经建立的连接继续转发。machine 模式还会把没有基线的增量降级成 REST 对账，面板回 304 时变更被丢掉。
+
+现在只断开被移除用户自己的 TCP 和 UDP 连接，并在原地更新这一台节点的用户表，其他用户和其他节点保持连接。相同的增量不会再次踢人。machine 模式在还没有基线时先把增量排进队列，基线到达后直接套用，不再走会被 304 丢掉的 REST 对账。空用户快照和异常大幅掉用户的校验保持不变。协议无法原地改用户表时，才重启该节点自己的内核实例。

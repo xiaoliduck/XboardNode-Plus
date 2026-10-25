@@ -18,6 +18,7 @@ import (
 	"github.com/xtls/xray-core/common/session"
 	"github.com/xtls/xray-core/features/routing"
 	"github.com/xtls/xray-core/transport"
+	"golang.org/x/time/rate"
 
 	"github.com/cedar2025/xboard-node/internal/accesslog"
 	"github.com/cedar2025/xboard-node/internal/nlog"
@@ -76,14 +77,19 @@ type LimitDispatcher struct {
 
 	// limitedUsers: users with device limit > 0, protected by mu.
 	// Needs deterministic IP ordering for kick decisions.
-	mu           sync.RWMutex
-	limitedIPs   map[string]map[string]int // email → sourceIP → refcount
-	deviceLimits map[string]int            // email → max devices
-	emailToUID   map[string]int            // email → panel user ID
+	mu            sync.RWMutex
+	limitedIPs    map[string]map[string]int // email → sourceIP → refcount
+	deviceLimits  map[string]int            // email → max devices
+	emailToUID    map[string]int            // email → panel user ID
+	speedLimiters map[string]*rate.Limiter  // email → shared per-user limiter
 
 	accessMu  sync.Mutex
 	access    map[string]*accesslog.Activity
 	accessSeq atomic.Uint64
+
+	// userWriters keeps the links that can be interrupted for one user.
+	// Removing a user closes only these, not the whole xray instance.
+	userWriters map[string]map[*closeTrackingWriter]struct{}
 
 	// unlimitedIPs: users without device limit — sync.Map for lock-free access.
 	// Each entry is *ipCounter{ips sync.Map}.
@@ -127,7 +133,7 @@ func (d *LimitDispatcher) Dispatch(ctx context.Context, dest net.Destination) (*
 
 	if email != "" {
 		activity := d.recordAccess(email, sourceIP, dest)
-		d.trackLink(link, email, sourceIP, isTCP, activity)
+		d.trackLink(ctx, link, email, sourceIP, isTCP, activity)
 	}
 	return link, nil
 }
@@ -140,7 +146,7 @@ func (d *LimitDispatcher) DispatchLink(ctx context.Context, dest net.Destination
 
 	if email != "" {
 		activity := d.recordAccess(email, sourceIP, dest)
-		d.trackLink(link, email, sourceIP, isTCP, activity)
+		d.trackLink(ctx, link, email, sourceIP, isTCP, activity)
 	}
 	return d.innerDisp.DispatchLink(ctx, dest, link)
 }
@@ -167,7 +173,7 @@ func (d *LimitDispatcher) identifyAndCheck(ctx context.Context, dest net.Destina
 // trackLink records connection lifecycle without replacing link.Reader. This
 // keeps mux/XUDP compatible while still allowing the dispatcher to release
 // device-limit state when the link closes.
-func (d *LimitDispatcher) trackLink(link *transport.Link, email, sourceIP string, isTCP bool, activity *accesslog.Activity) {
+func (d *LimitDispatcher) trackLink(ctx context.Context, link *transport.Link, email, sourceIP string, isTCP bool, activity *accesslog.Activity) {
 	d.connCount.Add(1)
 
 	onClose := func() {
@@ -178,11 +184,63 @@ func (d *LimitDispatcher) trackLink(link *transport.Link, email, sourceIP string
 		d.connCount.Add(-1)
 	}
 
-	link.Writer = &closeTrackingWriter{
+	d.mu.RLock()
+	lim := d.speedLimiters[email]
+	d.mu.RUnlock()
+
+	w := &closeTrackingWriter{
 		Writer:  link.Writer,
-		onClose: onClose,
 		access:  activity,
+		limiter: lim,
+		ctx:     ctx,
 	}
+	w.onClose = func() {
+		d.unbindWriter(email, w)
+		onClose()
+	}
+	d.bindWriter(email, w)
+	link.Writer = w
+}
+
+func (d *LimitDispatcher) bindWriter(email string, w *closeTrackingWriter) {
+	d.mu.Lock()
+	if d.userWriters == nil {
+		d.userWriters = make(map[string]map[*closeTrackingWriter]struct{})
+	}
+	set := d.userWriters[email]
+	if set == nil {
+		set = make(map[*closeTrackingWriter]struct{})
+		d.userWriters[email] = set
+	}
+	set[w] = struct{}{}
+	d.mu.Unlock()
+}
+
+func (d *LimitDispatcher) unbindWriter(email string, w *closeTrackingWriter) {
+	d.mu.Lock()
+	if set := d.userWriters[email]; set != nil {
+		delete(set, w)
+		if len(set) == 0 {
+			delete(d.userWriters, email)
+		}
+	}
+	d.mu.Unlock()
+}
+
+// CloseUser interrupts live links for one email. Other users stay up.
+func (d *LimitDispatcher) CloseUser(email string) int {
+	d.mu.Lock()
+	set := d.userWriters[email]
+	delete(d.userWriters, email)
+	writers := make([]*closeTrackingWriter, 0, len(set))
+	for w := range set {
+		writers = append(writers, w)
+	}
+	d.mu.Unlock()
+	for _, w := range writers {
+		w.Interrupt()
+	}
+	return len(writers)
 }
 
 // ─── features.Feature (delegated) ───────────────────────────────────────────
@@ -205,12 +263,12 @@ func (d *LimitDispatcher) Close() error {
 
 // ─── Limit management (called by Xray kernel) ──────────────────────────────
 
-func (d *LimitDispatcher) UpdateLimits(emailToUID map[string]int, deviceLimits, _ map[string]int) {
+func (d *LimitDispatcher) UpdateLimits(emailToUID map[string]int, deviceLimits map[string]int, speedLimiters map[string]*rate.Limiter) {
 	d.mu.Lock()
 	d.emailToUID = emailToUID
 	d.deviceLimits = deviceLimits
+	d.speedLimiters = speedLimiters
 	d.mu.Unlock()
-
 }
 
 func (d *LimitDispatcher) ResetConns() {
@@ -470,16 +528,49 @@ type closeTrackingWriter struct {
 	buf.Writer
 	onClose func()
 	access  *accesslog.Activity
+	limiter *rate.Limiter
+	ctx     context.Context
 	closed  atomic.Bool
 }
 
 func (w *closeTrackingWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
+	if w.limiter != nil {
+		ctx := w.ctx
+		if ctx == nil {
+			ctx = context.Background()
+		}
+		if err := waitRateLimit(ctx, w.limiter, int(mb.Len())); err != nil {
+			buf.ReleaseMulti(mb)
+			return err
+		}
+	}
 	n := int64(mb.Len())
 	err := w.Writer.WriteMultiBuffer(mb)
 	if err == nil {
 		w.access.AddUpload(n)
 	}
 	return err
+}
+
+func waitRateLimit(ctx context.Context, lim *rate.Limiter, n int) error {
+	if n <= 0 {
+		return nil
+	}
+	burst := lim.Burst()
+	if burst <= 0 {
+		burst = 1
+	}
+	for n > 0 {
+		chunk := n
+		if chunk > burst {
+			chunk = burst
+		}
+		if err := lim.WaitN(ctx, chunk); err != nil {
+			return err
+		}
+		n -= chunk
+	}
+	return nil
 }
 
 func (w *closeTrackingWriter) Close() error {
